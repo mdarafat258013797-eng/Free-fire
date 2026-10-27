@@ -1,0 +1,216 @@
+name: Free Fire MOD APK - Auto Offset
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  FF_PKG: com.dts.freefireth
+
+  # ============== চিট লিস্ট ==============
+  # ফরম্যাট:   method_name|hex      (offset নিজে খুঁজে নেবে)
+  #       বা:  0xOFFSET|hex
+  # arm64:  return 0 -> 000080D2C0035FD6
+  #         return 1 -> 200080D2C0035FD6
+  TARGETS: |
+    get_isAlive|200080D2C0035FD6
+    get_isVisible|200080D2C0035FD6
+    IsFiring|200080D2C0035FD6
+    get_AttackableEntity_IsVisible|200080D2C0035FD6
+    get_AttackableEntity_GetIsDead|000080D2C0035FD6
+    get_IsSighting|000080D2C0035FD6
+    get_IsCrouching|000080D2C0035FD6
+    get_isLocalTeam|000080D2C0035FD6
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            6.0.x
+            8.0.x
+
+      - name: Android build-tools
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM=$(find "$SDK" -name sdkmanager -type f | head -1)
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" "build-tools;34.0.0" > /dev/null 2>&1 || true
+          echo "BT=$SDK/build-tools/34.0.0" >> "$GITHUB_ENV"
+          sudo apt-get install -y mono-complete > /dev/null 2>&1 || true
+
+      - name: Keystore
+        run: |
+          keytool -genkeypair -v -keystore ks.jks -alias ffmod \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass 123456 -keypass 123456 -dname "CN=FFMOD"
+
+      - name: Download Free Fire
+        run: |
+          curl -L -A "Mozilla/5.0 (Linux; Android 12)" -o ff.bin \
+            "https://d.apkpure.com/b/XAPK/${FF_PKG}?version=latest" || true
+          if [ ! -s ff.bin ]; then
+            curl -L -A "Mozilla/5.0 (Linux; Android 12)" -o ff.bin \
+              "https://d.apkpure.com/b/APK/${FF_PKG}?version=latest"
+          fi
+          ls -la ff.bin
+
+      - name: Get Il2CppDumper-Free-Fire
+        run: |
+          mkdir -p dumper
+          DL=$(curl -s https://api.github.com/repos/tien0246/Il2CppDumper-Free-Fire/releases/latest \
+               | grep -o '"browser_download_url": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+          if [ -n "$DL" ]; then
+            curl -L -o d.zip "$DL" && unzip -o d.zip -d dumper > /dev/null || true
+          fi
+          if ! find dumper -iname "Il2CppDumper*" -type f | grep -q .; then
+            git clone --depth 1 https://github.com/tien0246/Il2CppDumper-Free-Fire.git src
+            CSP=$(find src -name "*.csproj" | head -1)
+            dotnet publish "$CSP" -c Release -o dumper/build
+          fi
+          find dumper -iname "Il2CppDumper*" -type f
+
+      - name: Extract APK + Dump
+        run: |
+          rm -rf work && mkdir -p work
+          cd work && unzip -o ../ff.bin > /dev/null && cd ..
+          if ! find work -name "libil2cpp.so" | grep -q .; then
+            for a in $(find work -name "*.apk"); do
+              mkdir -p "$a.d" && unzip -o "$a" -d "$a.d" > /dev/null
+            done
+          fi
+          LIB=$(find work -path "*arm64-v8a*" -name "libil2cpp.so" | head -1)
+          [ -z "$LIB" ] && LIB=$(find work -name "libil2cpp.so" | head -1)
+          META=$(find work -name "global-metadata.dat" | head -1)
+          echo "LIB=$LIB" && echo "META=$META"
+          [ -z "$LIB" ] && { echo "libil2cpp.so নেই"; exit 1; }
+          [ -z "$META" ] && { echo "global-metadata.dat নেই"; exit 1; }
+          echo "LIB=$LIB" >> "$GITHUB_ENV"
+          echo "META=$META" >> "$GITHUB_ENV"
+          mkdir -p dumpout
+          RUN=$(find dumper -name "Il2CppDumper.dll" | head -1)
+          EXE=$(find dumper -iname "Il2CppDumper.exe" | head -1)
+          if [ -n "$RUN" ]; then
+            dotnet "$RUN" "$LIB" "$META" dumpout || { [ -n "$EXE" ] && mono "$EXE" "$LIB" "$META" dumpout; }
+          else
+            mono "$EXE" "$LIB" "$META" dumpout
+          fi
+          ls -la dumpout
+          [ -f dumpout/dump.cs ] || { echo "dump.cs তৈরি হয়নি"; exit 1; }
+
+      - name: Patch with auto offset
+        run: |
+          cat > patch.py <<'PYEOF'
+          import os, re, glob, shutil, zipfile, subprocess
+
+          WORK = "work"; BT = os.environ["BT"]; LIB = os.environ["LIB"]
+          RAW = os.environ.get("TARGETS", "")
+          KS = os.path.abspath("ks.jks"); PW = "123456"
+
+          def sh(c):
+              print("$", " ".join(c)); subprocess.run(c, check=True)
+
+          rx = re.compile(r"//\s*RVA:\s*0x([0-9A-Fa-f]+)\s*Offset:\s*0x([0-9A-Fa-f]+)")
+          name2off = {}; pending = None
+          for line in open("dumpout/dump.cs", encoding="utf-8", errors="ignore"):
+              m = rx.search(line)
+              if m:
+                  pending = int(m.group(2), 16); continue
+              if pending is not None:
+                  s = line.strip()
+                  if "(" in s and not s.startswith("//"):
+                      before = s.split("(")[0]
+                      toks = [t for t in re.split(r"[^\w\.]", before) if t]
+                      if toks:
+                          nm = toks[-1]
+                          if nm and not nm.startswith("<") and nm not in name2off:
+                              name2off[nm] = pending
+                  pending = None
+
+          print("dump.cs থেকে ফাংশন:", len(name2off))
+
+          targets = []
+          for line in RAW.splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"): continue
+              p = [x.strip() for x in line.split("|")]
+              if len(p) < 2: continue
+              targets.append((p[0], bytes.fromhex(p[1])))
+
+          report = []
+          with open(LIB, "r+b") as f:
+              for key, data in targets:
+                  pos = int(key, 16) if key.lower().startswith("0x") else name2off.get(key)
+                  if pos is None:
+                      report.append("MISS  " + key); continue
+                  f.seek(pos); old = f.read(len(data)); f.seek(pos); f.write(data)
+                  report.append("OK    %s  @0x%X  %s -> %s" % (key, pos, old.hex(), data.hex()))
+
+          KW = ["Recoil","Ammo","Speed","Damage","Headshot","Spread","Reload",
+                "Health","Aim","Visible","Alive","Firing","Crouch","Parachut",
+                "Run","Walk","Jump","Fire","Weapon","Hit","Head"]
+          cand = sorted("0x%X\t%s" % (o, n) for n, o in name2off.items()
+                        if any(k.lower() in n.lower() for k in KW))
+
+          with open("report.txt", "w") as f:
+              f.write("=== PATCH REPORT ===\n" + "\n".join(report) + "\n\n")
+              f.write("=== CANDIDATE METHODS ===\n" + "\n".join(cand[:400]) + "\n")
+          print("\n=== REPORT ===\n" + "\n".join(report))
+
+          def zipdir(folder, out):
+              if os.path.exists(out): os.remove(out)
+              with zipfile.ZipFile(out, "w") as z:
+                  for root, dirs, files in os.walk(folder):
+                      rr = os.path.relpath(root, folder)
+                      dirs[:] = [d for d in dirs if not d.endswith(".d")
+                                 and not (rr == "." and d == "META-INF")]
+                      for fn in files:
+                          rel = os.path.relpath(os.path.join(root, fn), folder)
+                          if any(p.endswith(".d") for p in rel.split(os.sep)[:-1]): continue
+                          ct = zipfile.ZIP_STORED if (fn.endswith(".so") or fn == "resources.arsc") else zipfile.ZIP_DEFLATED
+                          z.write(os.path.join(root, fn), rel, compress_type=ct)
+
+          def align(a, b): sh([os.path.join(BT, "zipalign"), "-p", "-f", "4", a, b])
+          def sign(a, b): sh([os.path.join(BT, "apksigner"), "sign", "--ks", KS,
+                              "--ks-pass", "pass:"+PW, "--key-pass", "pass:"+PW, "--out", b, a])
+
+          inner = sorted(glob.glob(os.path.join(WORK, "*.apk.d")))
+          if inner:
+              for d in inner:
+                  apk = d[:-2]
+                  zipdir(d, "u.apk"); align("u.apk", "a.apk"); sign("a.apk", "s.apk")
+                  shutil.copy("s.apk", apk)
+              zipdir(WORK, "FreeFire-MOD.xapk")
+              print("OUTPUT: FreeFire-MOD.xapk")
+          else:
+              zipdir(WORK, "u.apk"); align("u.apk", "a.apk"); sign("a.apk", "FreeFire-MOD.apk")
+              print("OUTPUT: FreeFire-MOD.apk")
+          PYEOF
+          python3 patch.py
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeFire-MOD
+          path: |
+            FreeFire-MOD.apk
+            FreeFire-MOD.xapk
+            dumpout/dump.cs
+            report.txt
+          if-no-files-found: error
